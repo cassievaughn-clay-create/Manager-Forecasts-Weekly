@@ -10,6 +10,12 @@ standalone/
 .env.local
 .env.*.local
 
+# generated DB seed — contains real forecast data, never commit
+seed.sql
+
+# vercel
+.vercel/
+
 # editor / OS
 .DS_Store
 *.log

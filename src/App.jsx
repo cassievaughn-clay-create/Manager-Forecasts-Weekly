@@ -181,12 +181,13 @@ async function sset(k, v) {
   } catch { /* ignore quota / serialization / network errors */ }
 }
 
-/* ---------- auth gate ----------
+/* ---------- auth gate (email one-time-password) ----------
  * When Supabase is configured, require a signed-in user before the app loads.
- * If VITE_ALLOWED_EMAIL_DOMAIN is set (e.g. "clay.com"), only that Google
- * Workspace domain may proceed. This is the UX gate; the hard enforcement is
- * the Row Level Security policies on the database (see SETUP.md), which reject
- * any read/write whose JWT email isn't on the allowed domain. */
+ * Login is passwordless: the user enters their email, Supabase emails a 6-digit
+ * one-time code, they type it back. If VITE_ALLOWED_EMAIL_DOMAIN is set (e.g.
+ * "clay.com") only that domain may request a code. That client check is UX; the
+ * hard enforcement is the Row Level Security policies on the database (see
+ * SETUP.md), which reject any read/write whose JWT email isn't on the domain. */
 const gateWrap = {
   minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
   background: T.ink, color: T.text, fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif", padding: 24,
@@ -199,25 +200,24 @@ const gateBtn = {
   width: "100%", marginTop: 18, padding: "11px 14px", borderRadius: 9, cursor: "pointer",
   border: `1px solid ${T.line}`, background: T.accent, color: "#04121d", fontWeight: 700, fontSize: 14,
 };
+const gateInput = {
+  width: "100%", marginTop: 14, padding: "11px 12px", borderRadius: 9, fontSize: 14, boxSizing: "border-box",
+  border: `1px solid ${T.line}`, background: T.panel2, color: T.text,
+};
 const gateLink = {
   marginTop: 14, background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 12, textDecoration: "underline",
 };
 
-async function signInWithGoogle() {
-  await supabase.auth.signInWithOAuth({
-    provider: "google",
-    options: {
-      redirectTo: window.location.origin,
-      // Pre-fills the Google account chooser with the workspace domain (a hint,
-      // not a security boundary — RLS is the boundary).
-      queryParams: ALLOWED_EMAIL_DOMAIN ? { hd: ALLOWED_EMAIL_DOMAIN } : undefined,
-    },
-  });
-}
-
 function AuthGate({ children }) {
   // `undefined` = still checking, `null` = signed out, object = signed in.
   const [session, setSession] = useState(undefined);
+  const [step, setStep] = useState("email"); // "email" → "code"
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+
   useEffect(() => {
     if (!supabaseConfigured) { setSession(null); return; }
     let active = true;
@@ -229,6 +229,32 @@ function AuthGate({ children }) {
   // No backend configured → no auth; run on localStorage exactly as before.
   if (!supabaseConfigured) return children;
 
+  const domainOk = (e) =>
+    !ALLOWED_EMAIL_DOMAIN || e.trim().toLowerCase().endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase());
+
+  async function sendCode(ev) {
+    ev?.preventDefault?.();
+    const addr = email.trim().toLowerCase();
+    setErr(""); setMsg("");
+    if (!domainOk(addr)) { setErr(`Use your @${ALLOWED_EMAIL_DOMAIN} email.`); return; }
+    setBusy(true);
+    const { error } = await supabase.auth.signInWithOtp({ email: addr, options: { shouldCreateUser: true } });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    setStep("code"); setMsg(`We emailed a 6-digit code to ${addr}.`);
+  }
+
+  async function verify(ev) {
+    ev?.preventDefault?.();
+    setErr(""); setBusy(true);
+    const { error } = await supabase.auth.verifyOtp({
+      email: email.trim().toLowerCase(), token: code.trim(), type: "email",
+    });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    // onAuthStateChange sets the session and the app loads.
+  }
+
   if (session === undefined) {
     return <div style={gateWrap}><div style={{ color: T.muted }}>Checking your session…</div></div>;
   }
@@ -236,30 +262,47 @@ function AuthGate({ children }) {
   if (!session) {
     return (
       <div style={gateWrap}>
-        <div style={gateCard}>
+        <form style={gateCard} onSubmit={step === "email" ? sendCode : verify}>
           <div style={{ fontSize: 18, fontWeight: 800 }}>Forecast Cockpit</div>
           <div style={{ color: T.muted, fontSize: 13, marginTop: 6 }}>Weekly Manager Review</div>
-          <button style={gateBtn} onClick={signInWithGoogle}>Continue with Google</button>
-          {ALLOWED_EMAIL_DOMAIN && (
-            <div style={{ color: T.faint, fontSize: 11, marginTop: 14 }}>
-              Use your @{ALLOWED_EMAIL_DOMAIN} account.
-            </div>
+          {step === "email" ? (
+            <>
+              <input style={gateInput} type="email" autoFocus autoComplete="email"
+                placeholder={`you@${ALLOWED_EMAIL_DOMAIN || "company.com"}`}
+                value={email} onChange={(e) => setEmail(e.target.value)} />
+              <button style={gateBtn} type="submit" disabled={busy}>{busy ? "Sending…" : "Email me a sign-in code"}</button>
+              {ALLOWED_EMAIL_DOMAIN && (
+                <div style={{ color: T.faint, fontSize: 11, marginTop: 14 }}>Restricted to @{ALLOWED_EMAIL_DOMAIN} emails.</div>
+              )}
+            </>
+          ) : (
+            <>
+              <input style={gateInput} inputMode="numeric" autoFocus autoComplete="one-time-code"
+                placeholder="6-digit code" value={code} onChange={(e) => setCode(e.target.value)} />
+              <button style={gateBtn} type="submit" disabled={busy}>{busy ? "Verifying…" : "Verify & sign in"}</button>
+              <button style={gateLink} type="button"
+                onClick={() => { setStep("email"); setCode(""); setErr(""); setMsg(""); }}>
+                Use a different email
+              </button>
+            </>
           )}
-        </div>
+          {msg && <div style={{ color: T.muted, fontSize: 12, marginTop: 12 }}>{msg}</div>}
+          {err && <div style={{ color: T.down, fontSize: 12, marginTop: 12 }}>{err}</div>}
+        </form>
       </div>
     );
   }
 
-  const email = (session.user?.email || "").toLowerCase();
-  if (ALLOWED_EMAIL_DOMAIN && !email.endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase())) {
+  const signedEmail = (session.user?.email || "").toLowerCase();
+  if (ALLOWED_EMAIL_DOMAIN && !signedEmail.endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase())) {
     return (
       <div style={gateWrap}>
         <div style={gateCard}>
           <div style={{ fontSize: 16, fontWeight: 800, color: T.down }}>Access restricted</div>
           <div style={{ color: T.muted, fontSize: 13, marginTop: 8 }}>
-            {email || "This account"} isn't on the @{ALLOWED_EMAIL_DOMAIN} domain.
+            {signedEmail || "This account"} isn't on the @{ALLOWED_EMAIL_DOMAIN} domain.
           </div>
-          <button style={gateLink} onClick={() => supabase.auth.signOut()}>Sign in with a different account</button>
+          <button style={gateLink} onClick={() => supabase.auth.signOut()}>Sign out</button>
         </div>
       </div>
     );

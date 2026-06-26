@@ -61,12 +61,14 @@ This started life as a Claude artifact, where the host provides two conveniences
 **do not exist when you run this repo on your own**:
 
 1. **Persistence.** In Claude, data is saved via `window.storage`. Standalone, the app
-   falls back to **`localStorage`** (one browser only) — **or, when you set the
-   `VITE_SUPABASE_*` env vars, to a shared, durable, auth-gated Supabase database.**
-   See **[SETUP.md](SETUP.md)** for the ~10-minute, no-cost Supabase setup (Google
-   sign-in restricted to your `@clay.com` domain, enforced by Row Level Security).
-   The `sget`/`sset` helpers in `src/App.jsx` pick the backend automatically — no code
-   changes needed to switch.
+   falls back to **`localStorage`** (one browser only) — **or, when the `VITE_SUPABASE_*`
+   env vars are set, to a shared, durable Supabase database.** Deployment is
+   **Vercel + Supabase, wired through GitHub** for controlled deploys (push to `main` →
+   production, every PR → a preview URL). Login is a passwordless **email one-time code
+   restricted to `@clay.com`**, enforced by Supabase Row Level Security. See
+   **[SETUP.md](SETUP.md)** for the full (free) setup. The `sget`/`sset` helpers in
+   `src/App.jsx` pick the backend automatically off `VITE_SUPABASE_*` — no code changes
+   to switch.
 
 2. **AI pipeline tips.** In Claude, the "Suggest tips" button calls the Anthropic API
    with auth injected by the host. Standalone, a browser can't call the API directly
