@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+standalone/
+
+# local env (never commit real keys — only .env.example is tracked)
+.env
+.env.local
+.env.*.local
+
+# editor / OS
+.DS_Store
+*.log

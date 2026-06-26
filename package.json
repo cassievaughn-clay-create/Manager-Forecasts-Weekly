@@ -7,9 +7,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:standalone": "vite build --config vite.singlefile.config.js",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
     "lucide-react": "^0.383.0",
     "papaparse": "^5.4.1",
     "react": "^18.3.1",
@@ -18,6 +20,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.3.1"
+    "vite": "^5.3.1",
+    "vite-plugin-singlefile": "^2.3.3"
   }
 }

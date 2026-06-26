@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import Papa from "papaparse";
+import { supabase, supabaseConfigured, ALLOWED_EMAIL_DOMAIN, KV_TABLE } from "./supabase.js";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid,
 } from "recharts";
@@ -143,14 +144,23 @@ const CSS = `
 `;
 
 /* ---------- storage helpers ----------
- * Inside Claude, window.storage persists across sessions.
- * Standalone (this repo), we fall back to localStorage so data still persists
- * in the browser. For multi-user / multi-device persistence, point these at a
- * real backend (see README). */
+ * Backends, in priority order:
+ *   1. Supabase  — shared, durable, cross-device storage (when configured via
+ *      VITE_SUPABASE_* env vars). All reads/writes go through one `forecast_kv`
+ *      key/value table; access is gated by Row Level Security (see SETUP.md).
+ *   2. window.storage — present only when running inside the Claude host.
+ *   3. localStorage — zero-config fallback so `npm run dev` works offline, but
+ *      data lives in that one browser only (not shared, not durable).
+ * Every entry holds the same JSON value, so the backends are interchangeable. */
 const hasStore = typeof window !== "undefined" && window.storage;
 const LS = typeof window !== "undefined" ? window.localStorage : null;
 async function sget(k) {
   try {
+    if (supabaseConfigured) {
+      const { data, error } = await supabase.from(KV_TABLE).select("value").eq("key", k).maybeSingle();
+      if (error) throw error;
+      return data ? data.value : null; // value is a jsonb column — already parsed
+    }
     if (hasStore) { const r = await window.storage.get(k); return r ? JSON.parse(r.value) : null; }
     if (LS) { const v = LS.getItem("wfm:" + k); return v ? JSON.parse(v) : null; }
     return null;
@@ -158,9 +168,104 @@ async function sget(k) {
 }
 async function sset(k, v) {
   try {
+    if (supabaseConfigured) {
+      const { error } = await supabase.from(KV_TABLE).upsert(
+        { key: k, value: v, updated_at: new Date().toISOString() },
+        { onConflict: "key" }
+      );
+      if (error) throw error;
+      return;
+    }
     if (hasStore) { await window.storage.set(k, JSON.stringify(v)); return; }
     if (LS) LS.setItem("wfm:" + k, JSON.stringify(v));
-  } catch { /* ignore quota / serialization errors */ }
+  } catch { /* ignore quota / serialization / network errors */ }
+}
+
+/* ---------- auth gate ----------
+ * When Supabase is configured, require a signed-in user before the app loads.
+ * If VITE_ALLOWED_EMAIL_DOMAIN is set (e.g. "clay.com"), only that Google
+ * Workspace domain may proceed. This is the UX gate; the hard enforcement is
+ * the Row Level Security policies on the database (see SETUP.md), which reject
+ * any read/write whose JWT email isn't on the allowed domain. */
+const gateWrap = {
+  minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+  background: T.ink, color: T.text, fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif", padding: 24,
+};
+const gateCard = {
+  width: "100%", maxWidth: 380, background: T.panel, border: `1px solid ${T.line}`,
+  borderRadius: 14, padding: 28, textAlign: "center", boxShadow: "0 12px 40px rgba(0,0,0,.4)",
+};
+const gateBtn = {
+  width: "100%", marginTop: 18, padding: "11px 14px", borderRadius: 9, cursor: "pointer",
+  border: `1px solid ${T.line}`, background: T.accent, color: "#04121d", fontWeight: 700, fontSize: 14,
+};
+const gateLink = {
+  marginTop: 14, background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 12, textDecoration: "underline",
+};
+
+async function signInWithGoogle() {
+  await supabase.auth.signInWithOAuth({
+    provider: "google",
+    options: {
+      redirectTo: window.location.origin,
+      // Pre-fills the Google account chooser with the workspace domain (a hint,
+      // not a security boundary — RLS is the boundary).
+      queryParams: ALLOWED_EMAIL_DOMAIN ? { hd: ALLOWED_EMAIL_DOMAIN } : undefined,
+    },
+  });
+}
+
+function AuthGate({ children }) {
+  // `undefined` = still checking, `null` = signed out, object = signed in.
+  const [session, setSession] = useState(undefined);
+  useEffect(() => {
+    if (!supabaseConfigured) { setSession(null); return; }
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => { if (active) setSession(data.session ?? null); });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s ?? null));
+    return () => { active = false; sub.subscription.unsubscribe(); };
+  }, []);
+
+  // No backend configured → no auth; run on localStorage exactly as before.
+  if (!supabaseConfigured) return children;
+
+  if (session === undefined) {
+    return <div style={gateWrap}><div style={{ color: T.muted }}>Checking your session…</div></div>;
+  }
+
+  if (!session) {
+    return (
+      <div style={gateWrap}>
+        <div style={gateCard}>
+          <div style={{ fontSize: 18, fontWeight: 800 }}>Forecast Cockpit</div>
+          <div style={{ color: T.muted, fontSize: 13, marginTop: 6 }}>Weekly Manager Review</div>
+          <button style={gateBtn} onClick={signInWithGoogle}>Continue with Google</button>
+          {ALLOWED_EMAIL_DOMAIN && (
+            <div style={{ color: T.faint, fontSize: 11, marginTop: 14 }}>
+              Use your @{ALLOWED_EMAIL_DOMAIN} account.
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const email = (session.user?.email || "").toLowerCase();
+  if (ALLOWED_EMAIL_DOMAIN && !email.endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase())) {
+    return (
+      <div style={gateWrap}>
+        <div style={gateCard}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: T.down }}>Access restricted</div>
+          <div style={{ color: T.muted, fontSize: 13, marginTop: 8 }}>
+            {email || "This account"} isn't on the @{ALLOWED_EMAIL_DOMAIN} domain.
+          </div>
+          <button style={gateLink} onClick={() => supabase.auth.signOut()}>Sign in with a different account</button>
+        </div>
+      </div>
+    );
+  }
+
+  return children;
 }
 
 /* ---------- AI suggestions endpoint ----------
@@ -211,11 +316,26 @@ function blankWeek(date, managers, prev) {
   };
 }
 
-export default function App() {
+export default function Root() {
+  return (
+    <AuthGate>
+      <App />
+    </AuthGate>
+  );
+}
+
+function App() {
   const [meta, setMeta] = useState(null);
   const [weeks, setWeeks] = useState({});
   const [tab, setTab] = useState("overview");
   const [loaded, setLoaded] = useState(false);
+  const [authEmail, setAuthEmail] = useState(null);
+
+  // Surface the signed-in account in the top bar (Supabase only).
+  useEffect(() => {
+    if (!supabaseConfigured) return;
+    supabase.auth.getUser().then(({ data }) => setAuthEmail(data.user?.email || null));
+  }, []);
 
   // boot
   useEffect(() => {
@@ -313,6 +433,12 @@ export default function App() {
             </select>
             <button className="btn pri sm" onClick={newWeek}><Plus size={15} />New week</button>
           </div>
+          {supabaseConfigured && (
+            <div className="row" style={{ gap: 8, marginLeft: 6 }}>
+              {authEmail && <span style={{ fontSize: 11, color: T.faint }} title={authEmail}>{authEmail}</span>}
+              <button className="btn gho sm" onClick={() => supabase.auth.signOut()}>Sign out</button>
+            </div>
+          )}
         </div>
 
         <div className="shell">
