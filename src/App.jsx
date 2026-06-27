@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import Papa from "papaparse";
+import { supabase, supabaseConfigured, ALLOWED_EMAIL_DOMAIN, KV_TABLE } from "./supabase.js";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid,
 } from "recharts";
@@ -143,14 +144,23 @@ const CSS = `
 `;
 
 /* ---------- storage helpers ----------
- * Inside Claude, window.storage persists across sessions.
- * Standalone (this repo), we fall back to localStorage so data still persists
- * in the browser. For multi-user / multi-device persistence, point these at a
- * real backend (see README). */
+ * Backends, in priority order:
+ *   1. Supabase  — shared, durable, cross-device storage (when configured via
+ *      VITE_SUPABASE_* env vars). All reads/writes go through one `forecast_kv`
+ *      key/value table; access is gated by Row Level Security (see SETUP.md).
+ *   2. window.storage — present only when running inside the Claude host.
+ *   3. localStorage — zero-config fallback so `npm run dev` works offline, but
+ *      data lives in that one browser only (not shared, not durable).
+ * Every entry holds the same JSON value, so the backends are interchangeable. */
 const hasStore = typeof window !== "undefined" && window.storage;
 const LS = typeof window !== "undefined" ? window.localStorage : null;
 async function sget(k) {
   try {
+    if (supabaseConfigured) {
+      const { data, error } = await supabase.from(KV_TABLE).select("value").eq("key", k).maybeSingle();
+      if (error) throw error;
+      return data ? data.value : null; // value is a jsonb column — already parsed
+    }
     if (hasStore) { const r = await window.storage.get(k); return r ? JSON.parse(r.value) : null; }
     if (LS) { const v = LS.getItem("wfm:" + k); return v ? JSON.parse(v) : null; }
     return null;
@@ -158,9 +168,154 @@ async function sget(k) {
 }
 async function sset(k, v) {
   try {
+    if (supabaseConfigured) {
+      const { error } = await supabase.from(KV_TABLE).upsert(
+        { key: k, value: v, updated_at: new Date().toISOString() },
+        { onConflict: "key" }
+      );
+      if (error) throw error;
+      return;
+    }
     if (hasStore) { await window.storage.set(k, JSON.stringify(v)); return; }
     if (LS) LS.setItem("wfm:" + k, JSON.stringify(v));
-  } catch { /* ignore quota / serialization errors */ }
+  } catch { /* ignore quota / serialization / network errors */ }
+}
+
+/* ---------- auth gate (email one-time-password) ----------
+ * When Supabase is configured, require a signed-in user before the app loads.
+ * Login is passwordless: the user enters their email, Supabase emails a 6-digit
+ * one-time code, they type it back. If VITE_ALLOWED_EMAIL_DOMAIN is set (e.g.
+ * "clay.com") only that domain may request a code. That client check is UX; the
+ * hard enforcement is the Row Level Security policies on the database (see
+ * SETUP.md), which reject any read/write whose JWT email isn't on the domain. */
+const gateWrap = {
+  minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+  background: T.ink, color: T.text, fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif", padding: 24,
+};
+const gateCard = {
+  width: "100%", maxWidth: 380, background: T.panel, border: `1px solid ${T.line}`,
+  borderRadius: 14, padding: 28, textAlign: "center", boxShadow: "0 12px 40px rgba(0,0,0,.4)",
+};
+const gateBtn = {
+  width: "100%", marginTop: 18, padding: "11px 14px", borderRadius: 9, cursor: "pointer",
+  border: `1px solid ${T.line}`, background: T.accent, color: "#04121d", fontWeight: 700, fontSize: 14,
+};
+const gateInput = {
+  width: "100%", marginTop: 14, padding: "11px 12px", borderRadius: 9, fontSize: 14, boxSizing: "border-box",
+  border: `1px solid ${T.line}`, background: T.panel2, color: T.text,
+};
+const gateLink = {
+  marginTop: 14, background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 12, textDecoration: "underline",
+};
+
+function AuthGate({ children }) {
+  // `undefined` = still checking, `null` = signed out, object = signed in.
+  const [session, setSession] = useState(undefined);
+  const [step, setStep] = useState("email"); // "email" → "code"
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    if (!supabaseConfigured) { setSession(null); return; }
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => { if (active) setSession(data.session ?? null); });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s ?? null));
+    return () => { active = false; sub.subscription.unsubscribe(); };
+  }, []);
+
+  // No backend configured → no auth; run on localStorage exactly as before.
+  if (!supabaseConfigured) return children;
+
+  const domainOk = (e) =>
+    !ALLOWED_EMAIL_DOMAIN || e.trim().toLowerCase().endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase());
+
+  async function sendCode(ev) {
+    ev?.preventDefault?.();
+    const addr = email.trim().toLowerCase();
+    setErr(""); setMsg("");
+    if (!domainOk(addr)) { setErr(`Use your @${ALLOWED_EMAIL_DOMAIN} email.`); return; }
+    setBusy(true);
+    // Invite-only: shouldCreateUser:false means a code is sent ONLY if this email
+    // already has an account (i.e. was invited). No self sign-up.
+    const { error } = await supabase.auth.signInWithOtp({ email: addr, options: { shouldCreateUser: false } });
+    setBusy(false);
+    if (error) {
+      setErr(/signup|not allowed|user not found|not found/i.test(error.message)
+        ? "No account for that email yet. Ask an admin to invite you."
+        : error.message);
+      return;
+    }
+    setStep("code"); setMsg(`We emailed a 6-digit code to ${addr}.`);
+  }
+
+  async function verify(ev) {
+    ev?.preventDefault?.();
+    setErr(""); setBusy(true);
+    const { error } = await supabase.auth.verifyOtp({
+      email: email.trim().toLowerCase(), token: code.trim(), type: "email",
+    });
+    setBusy(false);
+    if (error) { setErr(error.message); return; }
+    // onAuthStateChange sets the session and the app loads.
+  }
+
+  if (session === undefined) {
+    return <div style={gateWrap}><div style={{ color: T.muted }}>Checking your session…</div></div>;
+  }
+
+  if (!session) {
+    return (
+      <div style={gateWrap}>
+        <form style={gateCard} onSubmit={step === "email" ? sendCode : verify}>
+          <div style={{ fontSize: 18, fontWeight: 800 }}>Forecast Cockpit</div>
+          <div style={{ color: T.muted, fontSize: 13, marginTop: 6 }}>Weekly Manager Review</div>
+          {step === "email" ? (
+            <>
+              <input style={gateInput} type="email" autoFocus autoComplete="email"
+                placeholder={`you@${ALLOWED_EMAIL_DOMAIN || "company.com"}`}
+                value={email} onChange={(e) => setEmail(e.target.value)} />
+              <button style={gateBtn} type="submit" disabled={busy}>{busy ? "Sending…" : "Email me a sign-in code"}</button>
+              {ALLOWED_EMAIL_DOMAIN && (
+                <div style={{ color: T.faint, fontSize: 11, marginTop: 14 }}>Restricted to @{ALLOWED_EMAIL_DOMAIN} emails.</div>
+              )}
+            </>
+          ) : (
+            <>
+              <input style={gateInput} inputMode="numeric" autoFocus autoComplete="one-time-code"
+                placeholder="6-digit code" value={code} onChange={(e) => setCode(e.target.value)} />
+              <button style={gateBtn} type="submit" disabled={busy}>{busy ? "Verifying…" : "Verify & sign in"}</button>
+              <button style={gateLink} type="button"
+                onClick={() => { setStep("email"); setCode(""); setErr(""); setMsg(""); }}>
+                Use a different email
+              </button>
+            </>
+          )}
+          {msg && <div style={{ color: T.muted, fontSize: 12, marginTop: 12 }}>{msg}</div>}
+          {err && <div style={{ color: T.down, fontSize: 12, marginTop: 12 }}>{err}</div>}
+        </form>
+      </div>
+    );
+  }
+
+  const signedEmail = (session.user?.email || "").toLowerCase();
+  if (ALLOWED_EMAIL_DOMAIN && !signedEmail.endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase())) {
+    return (
+      <div style={gateWrap}>
+        <div style={gateCard}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: T.down }}>Access restricted</div>
+          <div style={{ color: T.muted, fontSize: 13, marginTop: 8 }}>
+            {signedEmail || "This account"} isn't on the @{ALLOWED_EMAIL_DOMAIN} domain.
+          </div>
+          <button style={gateLink} onClick={() => supabase.auth.signOut()}>Sign out</button>
+        </div>
+      </div>
+    );
+  }
+
+  return children;
 }
 
 /* ---------- AI suggestions endpoint ----------
@@ -211,11 +366,26 @@ function blankWeek(date, managers, prev) {
   };
 }
 
-export default function App() {
+export default function Root() {
+  return (
+    <AuthGate>
+      <App />
+    </AuthGate>
+  );
+}
+
+function App() {
   const [meta, setMeta] = useState(null);
   const [weeks, setWeeks] = useState({});
   const [tab, setTab] = useState("overview");
   const [loaded, setLoaded] = useState(false);
+  const [authEmail, setAuthEmail] = useState(null);
+
+  // Surface the signed-in account in the top bar (Supabase only).
+  useEffect(() => {
+    if (!supabaseConfigured) return;
+    supabase.auth.getUser().then(({ data }) => setAuthEmail(data.user?.email || null));
+  }, []);
 
   // boot
   useEffect(() => {
@@ -313,6 +483,12 @@ export default function App() {
             </select>
             <button className="btn pri sm" onClick={newWeek}><Plus size={15} />New week</button>
           </div>
+          {supabaseConfigured && (
+            <div className="row" style={{ gap: 8, marginLeft: 6 }}>
+              {authEmail && <span style={{ fontSize: 11, color: T.faint }} title={authEmail}>{authEmail}</span>}
+              <button className="btn gho sm" onClick={() => supabase.auth.signOut()}>Sign out</button>
+            </div>
+          )}
         </div>
 
         <div className="shell">
@@ -995,6 +1171,35 @@ function Update({ meta, week, totalCall, totalCommit, netSwing, flagged }) {
 function SettingsTab({ meta, saveMeta, updateWeek, week }) {
   const [nm, setNm] = useState("");
   const t = meta.thresholds;
+
+  // Team access (invite-only). Authenticated users invite teammates via the
+  // server-side /api/invite function (which holds the service_role key).
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteMsg, setInviteMsg] = useState("");
+  const [inviteErr, setInviteErr] = useState("");
+  async function invite() {
+    const target = inviteEmail.trim().toLowerCase();
+    setInviteMsg(""); setInviteErr("");
+    if (ALLOWED_EMAIL_DOMAIN && !target.endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase())) {
+      setInviteErr(`Only @${ALLOWED_EMAIL_DOMAIN} emails can be invited.`); return;
+    }
+    setInviteBusy(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const res = await fetch("/api/invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token || ""}` },
+        body: JSON.stringify({ email: target }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) setInviteErr(j.error || "Invite failed.");
+      else { setInviteMsg(j.note === "already invited" ? `${target} already has access.` : `Invite sent to ${target}.`); setInviteEmail(""); }
+    } catch {
+      setInviteErr("Invite failed — is the app deployed with the /api/invite function?");
+    }
+    setInviteBusy(false);
+  }
   function addMgr() {
     const name = nm.trim(); if (!name || meta.managers.includes(name)) return;
     saveMeta({ ...meta, managers: [...meta.managers, name] });
@@ -1047,6 +1252,27 @@ function SettingsTab({ meta, saveMeta, updateWeek, week }) {
           <p className="sub" style={{ margin: "5px 0 10px" }}>Target the call is measured against on {fmtDate(week.date)}.</p>
           <input type="number" className="mono" style={{ width: "100%" }} value={week.plan ?? ""} placeholder="e.g. 4200000" onChange={(e) => setPlan(e.target.value)} />
         </div>
+
+        {supabaseConfigured && (
+          <div className="card" style={{ gridColumn: "1 / -1" }}>
+            <b style={{ fontSize: 14 }}>Team access</b>
+            <p className="sub" style={{ margin: "5px 0 10px" }}>
+              Invite a teammate{ALLOWED_EMAIL_DOMAIN ? ` (@${ALLOWED_EMAIL_DOMAIN} only)` : ""}. They'll get an email to
+              sign in with a one-time code. There is no public sign-up — access is invite-only.
+            </p>
+            <div className="row">
+              <input style={{ flex: 1 }} type="email" value={inviteEmail}
+                placeholder={`teammate@${ALLOWED_EMAIL_DOMAIN || "company.com"}`}
+                onChange={(e) => setInviteEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && invite()} />
+              <button className="btn pri sm" onClick={invite} disabled={inviteBusy}>
+                {inviteBusy ? "Inviting…" : "Invite"}
+              </button>
+            </div>
+            {inviteMsg && <div style={{ color: T.up, fontSize: 12, marginTop: 8 }}>{inviteMsg}</div>}
+            {inviteErr && <div style={{ color: T.down, fontSize: 12, marginTop: 8 }}>{inviteErr}</div>}
+          </div>
+        )}
       </div>
     </>
   );

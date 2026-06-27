@@ -6,19 +6,32 @@ snapshotted week over week.
 
 ## Run it
 
+This is a Vite app, so **opening `index.html` directly from disk shows a blank page** —
+browsers block its module script over `file://`. You have to serve it over HTTP:
+
 ```bash
 npm install
-npm run dev
+npm run dev      # development, hot reload — open the http://localhost URL it prints
 ```
 
-Then open the local URL Vite prints (usually http://localhost:5173).
-
-Build for production:
+To view a production build:
 
 ```bash
 npm run build
-npm run preview
+npm run preview  # serves dist/ over HTTP
 ```
+
+### Want a file you can just double-click?
+
+Build a single self-contained HTML with everything inlined — it opens straight from the
+filesystem, no server needed:
+
+```bash
+npm run build:standalone   # writes standalone/index.html
+```
+
+Then double-click `standalone/index.html`. (A prebuilt copy, `Forecast-Cockpit.html`, is
+included at the repo root so you can open it immediately without building.)
 
 ## What's in here
 
@@ -48,9 +61,15 @@ This started life as a Claude artifact, where the host provides two conveniences
 **do not exist when you run this repo on your own**:
 
 1. **Persistence.** In Claude, data is saved via `window.storage`. Standalone, the app
-   falls back to **`localStorage`**, so your data persists in that browser only — not
-   across devices or teammates. For shared, durable storage, replace the `sget`/`sset`
-   helpers in `src/App.jsx` with calls to a real backend (Postgres, Supabase, etc.).
+   falls back to **`localStorage`** (one browser only) — **or, when the `VITE_SUPABASE_*`
+   env vars are set, to a shared, durable Supabase database.** Deployment is
+   **Vercel + Supabase, wired through GitHub** for controlled deploys (push to `main` →
+   production, every PR → a preview URL). Login is a passwordless **email one-time code**,
+   **invite-only** and restricted to `@clay.com` (no public sign-up; teammates are invited
+   from Settings → Team access via the `/api/invite` function), enforced by Supabase Row
+   Level Security. See **[SETUP.md](SETUP.md)** for the full (free) setup. The `sget`/`sset` helpers in
+   `src/App.jsx` pick the backend automatically off `VITE_SUPABASE_*` — no code changes
+   to switch.
 
 2. **AI pipeline tips.** In Claude, the "Suggest tips" button calls the Anthropic API
    with auth injected by the host. Standalone, a browser can't call the API directly
