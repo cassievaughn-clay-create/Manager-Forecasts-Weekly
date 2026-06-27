@@ -64,9 +64,10 @@ This started life as a Claude artifact, where the host provides two conveniences
    falls back to **`localStorage`** (one browser only) — **or, when the `VITE_SUPABASE_*`
    env vars are set, to a shared, durable Supabase database.** Deployment is
    **Vercel + Supabase, wired through GitHub** for controlled deploys (push to `main` →
-   production, every PR → a preview URL). Login is a passwordless **email one-time code
-   restricted to `@clay.com`**, enforced by Supabase Row Level Security. See
-   **[SETUP.md](SETUP.md)** for the full (free) setup. The `sget`/`sset` helpers in
+   production, every PR → a preview URL). Login is a passwordless **email one-time code**,
+   **invite-only** and restricted to `@clay.com` (no public sign-up; teammates are invited
+   from Settings → Team access via the `/api/invite` function), enforced by Supabase Row
+   Level Security. See **[SETUP.md](SETUP.md)** for the full (free) setup. The `sget`/`sset` helpers in
    `src/App.jsx` pick the backend automatically off `VITE_SUPABASE_*` — no code changes
    to switch.
 

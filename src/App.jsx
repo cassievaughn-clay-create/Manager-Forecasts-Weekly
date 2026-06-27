@@ -238,9 +238,16 @@ function AuthGate({ children }) {
     setErr(""); setMsg("");
     if (!domainOk(addr)) { setErr(`Use your @${ALLOWED_EMAIL_DOMAIN} email.`); return; }
     setBusy(true);
-    const { error } = await supabase.auth.signInWithOtp({ email: addr, options: { shouldCreateUser: true } });
+    // Invite-only: shouldCreateUser:false means a code is sent ONLY if this email
+    // already has an account (i.e. was invited). No self sign-up.
+    const { error } = await supabase.auth.signInWithOtp({ email: addr, options: { shouldCreateUser: false } });
     setBusy(false);
-    if (error) { setErr(error.message); return; }
+    if (error) {
+      setErr(/signup|not allowed|user not found|not found/i.test(error.message)
+        ? "No account for that email yet. Ask an admin to invite you."
+        : error.message);
+      return;
+    }
     setStep("code"); setMsg(`We emailed a 6-digit code to ${addr}.`);
   }
 
@@ -1164,6 +1171,35 @@ function Update({ meta, week, totalCall, totalCommit, netSwing, flagged }) {
 function SettingsTab({ meta, saveMeta, updateWeek, week }) {
   const [nm, setNm] = useState("");
   const t = meta.thresholds;
+
+  // Team access (invite-only). Authenticated users invite teammates via the
+  // server-side /api/invite function (which holds the service_role key).
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteMsg, setInviteMsg] = useState("");
+  const [inviteErr, setInviteErr] = useState("");
+  async function invite() {
+    const target = inviteEmail.trim().toLowerCase();
+    setInviteMsg(""); setInviteErr("");
+    if (ALLOWED_EMAIL_DOMAIN && !target.endsWith("@" + ALLOWED_EMAIL_DOMAIN.toLowerCase())) {
+      setInviteErr(`Only @${ALLOWED_EMAIL_DOMAIN} emails can be invited.`); return;
+    }
+    setInviteBusy(true);
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const res = await fetch("/api/invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token || ""}` },
+        body: JSON.stringify({ email: target }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) setInviteErr(j.error || "Invite failed.");
+      else { setInviteMsg(j.note === "already invited" ? `${target} already has access.` : `Invite sent to ${target}.`); setInviteEmail(""); }
+    } catch {
+      setInviteErr("Invite failed — is the app deployed with the /api/invite function?");
+    }
+    setInviteBusy(false);
+  }
   function addMgr() {
     const name = nm.trim(); if (!name || meta.managers.includes(name)) return;
     saveMeta({ ...meta, managers: [...meta.managers, name] });
@@ -1216,6 +1252,27 @@ function SettingsTab({ meta, saveMeta, updateWeek, week }) {
           <p className="sub" style={{ margin: "5px 0 10px" }}>Target the call is measured against on {fmtDate(week.date)}.</p>
           <input type="number" className="mono" style={{ width: "100%" }} value={week.plan ?? ""} placeholder="e.g. 4200000" onChange={(e) => setPlan(e.target.value)} />
         </div>
+
+        {supabaseConfigured && (
+          <div className="card" style={{ gridColumn: "1 / -1" }}>
+            <b style={{ fontSize: 14 }}>Team access</b>
+            <p className="sub" style={{ margin: "5px 0 10px" }}>
+              Invite a teammate{ALLOWED_EMAIL_DOMAIN ? ` (@${ALLOWED_EMAIL_DOMAIN} only)` : ""}. They'll get an email to
+              sign in with a one-time code. There is no public sign-up — access is invite-only.
+            </p>
+            <div className="row">
+              <input style={{ flex: 1 }} type="email" value={inviteEmail}
+                placeholder={`teammate@${ALLOWED_EMAIL_DOMAIN || "company.com"}`}
+                onChange={(e) => setInviteEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && invite()} />
+              <button className="btn pri sm" onClick={invite} disabled={inviteBusy}>
+                {inviteBusy ? "Inviting…" : "Invite"}
+              </button>
+            </div>
+            {inviteMsg && <div style={{ color: T.up, fontSize: 12, marginTop: 8 }}>{inviteMsg}</div>}
+            {inviteErr && <div style={{ color: T.down, fontSize: 12, marginTop: 8 }}>{inviteErr}</div>}
+          </div>
+        )}
       </div>
     </>
   );

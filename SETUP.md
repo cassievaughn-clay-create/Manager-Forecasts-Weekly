@@ -1,40 +1,33 @@
-# Deploying on Vercel + Supabase (GitHub-driven)
+# Deploying — Vercel + Supabase, invite-only OTP
 
-The app is a static Vite SPA. This setup wires it to:
+- **Host:** Vercel, at `https://forecasting.chris-apis.xyz`.
+- **DB + auth:** Supabase. Login is a passwordless **email one-time code**.
+- **Access:** **invite-only** — there is no public sign-up. An authenticated
+  user invites a teammate from **Settings → Team access**; only **`@clay.com`**
+  addresses can be invited or signed in. Auth emails come from
+  **`no-reply@forecasting.chris-apis.xyz`** (custom SMTP).
+- **Pipeline:** GitHub → Vercel. Push to `main` = production; PRs = preview URLs.
 
-- **Supabase** — the database (one `forecast_kv` table) **and** auth. Login is a
-  passwordless **email one-time code**, restricted to **`@clay.com`**.
-- **Vercel** — hosts the built SPA on a global CDN.
-- **GitHub** — the connective tissue: Vercel watches the repo and gives you
-  **controlled deployments** — every push to `main` ships to production, every
-  branch/PR gets its own preview URL.
-
-No backend server of your own: the browser talks to Supabase directly with the
-public **anon key**, and **Row Level Security** is what actually enforces the
-`@clay.com` restriction (the anon key is safe to ship — RLS does the gating).
+Enforcement layers: sign-in uses `shouldCreateUser:false` (no account, no code);
+Supabase public sign-ups are disabled; the invite function only accepts
+`@clay.com`; and **Row Level Security** blocks all data access unless the JWT
+email is `@clay.com`. The anon key is safe in the client because RLS is the gate.
 
 ---
 
-## 1. Create the Supabase project
+## 1. Supabase project + table + RLS
 
-1. <https://supabase.com> → sign in with GitHub → **New project**.
-2. Name it (e.g. `manager-forecasts`), choose a region, set a DB password.
-3. Wait ~2 min to provision.
-
-## 2. Create the table + RLS policies
-
-**SQL Editor → New query**, paste, **Run**:
+1. <https://supabase.com> → **New project** (e.g. `manager-forecasts`).
+2. **SQL Editor → New query**, run:
 
 ```sql
 create table public.forecast_kv (
-  key        text primary key,
-  value      jsonb not null,
+  key text primary key,
+  value jsonb not null,
   updated_at timestamptz not null default now()
 );
-
 alter table public.forecast_kv enable row level security;
 
--- Only a signed-in user whose email is on @clay.com can touch the data.
 create policy "clay read"   on public.forecast_kv for select
   using      ( (auth.jwt() ->> 'email') ilike '%@clay.com' );
 create policy "clay insert" on public.forecast_kv for insert
@@ -46,106 +39,120 @@ create policy "clay delete" on public.forecast_kv for delete
   using      ( (auth.jwt() ->> 'email') ilike '%@clay.com' );
 ```
 
-> Even if someone lifts the anon key out of the JS bundle, they get **zero rows**
-> without a valid Supabase session whose JWT email ends in `@clay.com` — and they
-> can't mint one.
+## 2. Auth configuration
 
-## 3. Configure email one-time-code login
+**a. Disable public sign-up.** Authentication → **Sign In / Providers → Email**:
+turn **off** "Allow new users to sign up". (Admin invites still work — they
+bypass this. This is what makes it invite-only.)
 
-1. **Authentication → Providers → Email**: make sure it's enabled.
-2. **Make the email contain the code.** Supabase's default email sends a magic
-   *link*; to show the 6-digit code the app asks for, go to **Authentication →
-   Emails → Magic Link** template and ensure it includes the token, e.g.:
+**b. Put the code in the email.** Authentication → **Emails**:
+- **Magic Link** template (used for the sign-in code) — include the token:
+  ```
+  Your sign-in code is: {{ .Token }}
+  ```
+- **Invite user** template — leave the link; you can add a friendly line.
 
-   ```
-   Your sign-in code is: {{ .Token }}
-   ```
+**c. Custom SMTP so mail comes from your domain.** Authentication → **Emails →
+SMTP Settings** → enable, and point it at a provider that has verified
+`chris-apis.xyz` (Resend's free tier works well):
+1. In the provider, **verify the domain `chris-apis.xyz`** by adding the SPF /
+   DKIM (and DMARC) DNS records they give you. (You already control this domain
+   for the Vercel host, so DNS is in the same place.)
+2. In Supabase SMTP Settings, set:
+   - **Sender email:** `no-reply@forecasting.chris-apis.xyz`
+   - **Sender name:** `Forecast Cockpit`
+   - host/port/username/password from the provider.
+> Without custom SMTP, Supabase's built-in sender is rate-limited (a few/hour)
+> and can't use your domain — so set this up before inviting real users.
 
-   (Clicking the link still works too — the app picks up either.)
-3. **Lock signups to your domain (defense in depth).** RLS already blocks
-   non-Clay data access, but to stop non-Clay addresses from creating accounts at
-   all, add a **Before User Created** Auth Hook, or keep it simple and rely on
-   RLS + the in-app check. The app only *requests* a code for `@clay.com`
-   addresses.
-4. **Deliverability (important for real use).** Supabase's built-in email sender
-   is rate-limited (a few per hour) and meant for testing. For reliable codes to
-   `@clay.com` inboxes, set a **custom SMTP** under **Authentication → Emails →
-   SMTP Settings** (Resend's free tier works well).
-5. **URL configuration.** Under **Authentication → URL Configuration**, set
-   **Site URL** to your Vercel production URL and add your preview URLs +
-   `http://localhost:5173` under **Redirect URLs** (needed if anyone clicks the
-   magic link rather than typing the code). You'll fill the Vercel URLs in after
-   step 5.
+**d. URLs.** Authentication → **URL Configuration**:
+- **Site URL:** `https://forecasting.chris-apis.xyz`
+- **Redirect URLs:** add `https://forecasting.chris-apis.xyz`,
+  `http://localhost:5173`, and your Vercel preview pattern
+  (`https://*.vercel.app`) for clicking invite/magic links.
 
-## 4. Push the repo to GitHub
-
-This branch is ready to go. Push it to a GitHub repo (the one Vercel will watch):
+## 3. Push to GitHub
 
 ```bash
-git push -u origin feat/vercel-supabase   # then open a PR / merge to main
+git push -u origin feat/vercel-supabase    # then merge to main when ready
 ```
 
-## 5. Connect Vercel to GitHub
+## 4. Import into Vercel + environment variables
 
-1. <https://vercel.com> → **Add New… → Project** → import the GitHub repo.
-2. Framework preset auto-detects **Vite** (build `npm run build`, output `dist`
-   — already pinned in [`vercel.json`](vercel.json)).
-3. **Environment Variables** — add these for **both Production and Preview**
-   (Project → Settings → Environment Variables). Values from Supabase →
-   **Project Settings → API**:
+Vercel → **Add New… → Project** → import the repo (Vite auto-detected; build
+`npm run build`, output `dist`, both pinned in `vercel.json`).
 
-   | Name | Value |
-   |---|---|
-   | `VITE_SUPABASE_URL` | `https://<project>.supabase.co` |
-   | `VITE_SUPABASE_ANON_KEY` | the **anon public** key (not `service_role`) |
-   | `VITE_ALLOWED_EMAIL_DOMAIN` | `clay.com` |
+Set env vars (Project → Settings → **Environment Variables**), for **Production
++ Preview**. Note the two groups:
 
-4. **Deploy.** From now on: push to `main` → production deploy; any branch/PR →
-   its own preview URL. That's your controlled-deployment pipeline.
+**Client (must be `VITE_`-prefixed — these ship in the browser, safe by design):**
 
-## 6. Close the loop on auth URLs
+| Name | Value |
+|---|---|
+| `VITE_SUPABASE_URL` | `https://<project>.supabase.co` |
+| `VITE_SUPABASE_ANON_KEY` | the **anon public** key |
+| `VITE_ALLOWED_EMAIL_DOMAIN` | `clay.com` |
 
-Copy your Vercel production URL (and the preview pattern, e.g.
-`https://*-<your-team>.vercel.app`) back into Supabase →
-**Authentication → URL Configuration** (Site URL + Redirect URLs).
+**Server (NO `VITE_` prefix — used only by `/api/invite`, never shipped):**
 
-## 7. Import the rescued data
+| Name | Value |
+|---|---|
+| `SUPABASE_URL` | `https://<project>.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | the **service_role** secret (Project Settings → API) |
+| `ALLOWED_EMAIL_DOMAIN` | `clay.com` |
+| `APP_URL` | `https://forecasting.chris-apis.xyz` |
 
-Generate INSERTs from your backup and run them in Supabase:
+Deploy.
+
+## 5. Attach the custom domain
+
+Vercel → Project → **Settings → Domains → Add** → `forecasting.chris-apis.xyz`.
+Add the CNAME (or A) record Vercel shows to `chris-apis.xyz`'s DNS. Once it
+verifies, the app is live there over HTTPS.
+
+## 6. Bootstrap the first user (you)
+
+Invite-only has a chicken-and-egg: create the first account by hand.
+Supabase → **Authentication → Users → Add user / Invite** → your `@clay.com`
+email. Then open `https://forecasting.chris-apis.xyz`, enter that email, get the
+code, sign in.
+
+## 7. Invite the team
+
+In the app: **Settings → Team access** → enter a teammate's `@clay.com` email →
+**Invite**. They get an email from `no-reply@forecasting.chris-apis.xyz`, then
+sign in with a one-time code. Non-`@clay.com` addresses are rejected.
+
+## 8. Migrate the rescued data (when ready)
 
 ```bash
 node scripts/backup-to-sql.mjs ~/Downloads/forecast-backup.json seed.sql
 ```
-
-Open `seed.sql`, copy it into **Supabase → SQL Editor**, and run. (Or paste the
-`meta` / `week:<date>` rows directly in the **Table Editor**.) `seed.sql` is
-gitignored — it holds real data, so it never lands in the repo.
+Paste `seed.sql` into Supabase → SQL Editor → Run. (`seed.sql` is gitignored —
+it holds real data.)
 
 ---
 
 ## Local development
 
 ```bash
-cp .env.example .env.local      # fill in the three VITE_ vars
-npm install
-npm run dev                     # http://localhost:5173 → email-code sign-in
+cp .env.example .env.local        # fill the VITE_ vars (and server vars if using `vercel dev`)
+npm install && npm run dev        # http://localhost:5173
 ```
+With no `.env.local`, the app runs on `localStorage` (no auth) for pure UI work.
+To exercise `/api/invite` locally, use `npx vercel dev` with the server vars set.
 
-With **no** `.env.local`, the app runs on `localStorage` (no sign-in) — handy for
-pure UI work.
+## How auth works (recap)
 
-## How the backend is chosen
-
-| Condition | Backend | Auth |
-|---|---|---|
-| `VITE_SUPABASE_*` set (Vercel, or local `.env.local`) | **Supabase** | email one-time code, `@clay.com` only |
-| Running inside Claude | `window.storage` | none |
-| Neither | `localStorage` | none |
-
-`sget`/`sset` in `src/App.jsx` switch automatically — no code edits to move
-between them.
+1. User enters their `@clay.com` email → `signInWithOtp({ shouldCreateUser:false })`.
+2. If they were invited (account exists) → Supabase emails a 6-digit code from
+   `no-reply@forecasting.chris-apis.xyz`. If not → "ask an admin to invite you."
+3. They enter the code → `verifyOtp` → session. RLS lets them read/write the
+   `@clay.com`-only data.
+4. Invites go through `/api/invite` (service_role, server-side), gated to
+   authenticated `@clay.com` callers inviting `@clay.com` targets.
 
 ## Cost
 
-Supabase free tier: 500 MB DB + 50k monthly auth users. Vercel Hobby: plenty for
-a static SPA. This dataset is a few KB.
+Supabase free tier (500 MB DB, 50k MAU) and Vercel Hobby cover this comfortably;
+the dataset is a few KB. (Custom SMTP provider may have its own free tier.)
