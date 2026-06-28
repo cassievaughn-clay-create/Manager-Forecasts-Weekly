@@ -8,6 +8,7 @@ import {
   LayoutDashboard, Users, ArrowUpDown, Megaphone, Lightbulb, TrendingDown,
   FileText, Settings as SettingsIcon, Plus, Trash2, Check, X, Copy, Sparkles,
   ChevronUp, ChevronDown, AlertTriangle, Activity, Download, Upload, LogOut,
+  ShieldCheck,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ *
@@ -361,19 +362,29 @@ function thisMonday() {
 const NAV = [
   ["overview", "Overview", LayoutDashboard],
   ["calls", "Manager Calls", Users],
+  ["grr", "GRR", ShieldCheck],
   ["swings", "Swings", ArrowUpDown],
   ["headlines", "Headlines", Megaphone],
   ["tips", "Pipeline Tips", Lightbulb],
-  ["trending", "Trending Behind", TrendingDown],
+  ["trending", "Trending", TrendingDown],
   ["update", "Weekly Update", FileText],
   ["settings", "Settings", SettingsIcon],
+];
+
+const TIP_STATUS = [
+  ["not_tried", "Not tried", "muted"],
+  ["in_progress", "In progress", "warn"],
+  ["successful", "Successful", "up"],
 ];
 
 function blankWeek(date, managers, prev) {
   const calls = {};
   managers.forEach((m) => {
     const p = prev?.calls?.[m];
-    calls[m] = { call: p?.call ?? null, commit: p?.commit ?? null, best: p?.best ?? null, note: "", prior: p?.call ?? null };
+    calls[m] = {
+      call: p?.call ?? null, commit: p?.commit ?? null, best: p?.best ?? null,
+      goal: p?.goal ?? null, closedWon: null, note: "", prior: p?.call ?? null,
+    };
   });
   return {
     id: date, date,
@@ -382,9 +393,13 @@ function blankWeek(date, managers, prev) {
     swings: [],
     headlines: (prev?.headlines || []).map((h) => ({ ...h, id: uid() })),
     tips: [],
-    trending: (prev?.trending || []).map((t) => ({ ...t, id: uid() })),
+    trending: (prev?.trending || []).map((t) => ({ ...t, id: uid(), actionPlan: t.actionPlan || "" })),
+    grr: { rows: (prev?.grr?.rows || []).map((r) => ({ ...r, id: uid(), closedWon: null, grrCall: null })) },
   };
 }
+
+// Default trending thresholds, including the ahead-of-pace rule.
+const DEFAULT_THRESHOLDS = { d180: 50, d270: 90, mode: "and", aheadD180: 90, aheadD270: 100, aheadMode: "and" };
 
 export default function Root() {
   return (
@@ -415,7 +430,7 @@ function App() {
         const d = thisMonday();
         if (supabaseConfigured) {
           // Production (real database): start clean — never seed demo data.
-          m = { activeWeek: d, weeks: [d], managers: [], thresholds: { d180: 50, d270: 90, mode: "and" } };
+          m = { activeWeek: d, weeks: [d], managers: [], thresholds: { ...DEFAULT_THRESHOLDS } };
           const wk = blankWeek(d, [], null);
           await sset("meta", m); await sset("week:" + d, wk);
           setWeeks({ [d]: wk });
@@ -423,7 +438,7 @@ function App() {
           // Local / Claude fallback: seed sample data so the UI isn't empty.
           const managers = ["Alvarez", "Chen", "Okafor", "Petrova"];
           m = { activeWeek: d, weeks: [d], managers,
-            thresholds: { d180: 50, d270: 90, mode: "and" } };
+            thresholds: { ...DEFAULT_THRESHOLDS } };
           const wk = blankWeek(d, managers, null);
           wk.plan = 4200000;
           wk.calls["Alvarez"] = { call: 980000, commit: 820000, best: 1100000, note: "Renewals tracking; one logo at risk", prior: 940000 };
@@ -578,7 +593,8 @@ function App() {
             {tab === "calls" && <Calls {...{ meta, week, prevWeek, updateWeek, saveMeta, totalCall }} />}
             {tab === "swings" && <Swings {...{ week, meta, updateWeek }} />}
             {tab === "headlines" && <Headlines {...{ week, meta, updateWeek }} />}
-            {tab === "tips" && <Tips {...{ week, updateWeek }} />}
+            {tab === "tips" && <Tips {...{ week, meta, updateWeek }} />}
+            {tab === "grr" && <GRR {...{ week, meta, updateWeek }} />}
             {tab === "trending" && <Trending {...{ week, meta, updateWeek, flagged }} />}
             {tab === "update" && <Update {...{ meta, week, totalCall, totalCommit, netSwing, flagged }} />}
             {tab === "settings" && <SettingsTab {...{ meta, saveMeta, updateWeek, week, exportData, importData }} />}
@@ -595,6 +611,23 @@ function flag(r, t) {
   if (r.day270 != null) checks.push(r.day270 < t.d270);
   if (!checks.length) return false; // not yet measured at any milestone
   return t.mode === "and" ? checks.every(Boolean) : checks.some(Boolean);
+}
+
+// Ahead-of-pace: an account pacing at/above the ahead thresholds.
+function flagAhead(r, t) {
+  const a180 = t.aheadD180 ?? 90, a270 = t.aheadD270 ?? 100, mode = t.aheadMode || "and";
+  const checks = [];
+  if (r.day180 != null) checks.push(r.day180 >= a180);
+  if (r.day270 != null) checks.push(r.day270 >= a270);
+  if (!checks.length) return false;
+  return mode === "and" ? checks.every(Boolean) : checks.some(Boolean);
+}
+
+// Behind / ahead / on-pace label for a trending row.
+function paceState(r, t) {
+  if (flag(r, t)) return "behind";
+  if (flagAhead(r, t)) return "ahead";
+  return "onpace";
 }
 
 /* ============================== OVERVIEW ============================== */
@@ -689,20 +722,28 @@ function Calls({ meta, week, prevWeek, updateWeek, saveMeta, totalCall }) {
       <div className="card" style={{ padding: 0, marginTop: 16 }}>
         <table>
           <thead><tr>
-            <th>Manager</th><th style={{ textAlign: "right" }}>Commit</th><th style={{ textAlign: "right" }}>Call</th>
-            <th style={{ textAlign: "right" }}>Best</th><th style={{ textAlign: "right" }}>WoW</th><th>Note</th>
+            <th>Manager</th><th style={{ textAlign: "right" }}>Goal</th><th style={{ textAlign: "right" }}>Commit</th>
+            <th style={{ textAlign: "right" }}>Call</th><th style={{ textAlign: "right" }}>Best</th>
+            <th style={{ textAlign: "right" }}>Closed-won</th><th style={{ textAlign: "right" }}>Attain</th>
+            <th style={{ textAlign: "right" }}>WoW</th><th>Note</th>
           </tr></thead>
           <tbody>
             {meta.managers.map((m) => {
               const c = week.calls[m] || {};
               const prior = prevWeek?.calls?.[m]?.call ?? c.prior;
               const d = c.call != null && prior != null ? c.call - prior : null;
+              const attain = c.goal ? (c.call ?? 0) / c.goal * 100 : null;
               return (
                 <tr key={m}>
                   <td style={{ fontWeight: 500 }}>{m}</td>
+                  <td className="cellnum"><input type="number" value={c.goal ?? ""} placeholder="—" onChange={(e) => set(m, "goal", e.target.value)} /></td>
                   <td className="cellnum"><input type="number" value={c.commit ?? ""} placeholder="—" onChange={(e) => set(m, "commit", e.target.value)} /></td>
                   <td className="cellnum"><input type="number" value={c.call ?? ""} placeholder="—" onChange={(e) => set(m, "call", e.target.value)} /></td>
                   <td className="cellnum"><input type="number" value={c.best ?? ""} placeholder="—" onChange={(e) => set(m, "best", e.target.value)} /></td>
+                  <td className="cellnum"><input type="number" value={c.closedWon ?? ""} placeholder="—" onChange={(e) => set(m, "closedWon", e.target.value)} /></td>
+                  <td className="mono" style={{ textAlign: "right", color: attain == null ? T.muted : attain >= 100 ? T.up : attain >= 90 ? T.warn : T.down }}>
+                    {attain == null ? "—" : pct(attain)}
+                  </td>
                   <td className="mono" style={{ textAlign: "right", color: d > 0 ? T.up : d < 0 ? T.down : T.muted }}>
                     {d == null ? "—" : (d === 0 ? "flat" : (d > 0 ? "+" : "−") + money(Math.abs(d)))}
                   </td>
@@ -711,8 +752,12 @@ function Calls({ meta, week, prevWeek, updateWeek, saveMeta, totalCall }) {
             })}
           </tbody>
           <tfoot><tr>
-            <td style={{ fontWeight: 600 }}>Total</td><td></td>
-            <td className="mono" style={{ textAlign: "right", fontWeight: 600, color: T.accent, paddingRight: 19 }}>{money(totalCall)}</td>
+            <td style={{ fontWeight: 600 }}>Total</td>
+            <td className="mono" style={{ textAlign: "right", color: T.muted }}>{money(meta.managers.reduce((s, m) => s + (week.calls[m]?.goal || 0), 0))}</td>
+            <td></td>
+            <td className="mono" style={{ textAlign: "right", fontWeight: 600, color: T.accent }}>{money(totalCall)}</td>
+            <td></td>
+            <td className="mono" style={{ textAlign: "right", color: T.up }}>{money(meta.managers.reduce((s, m) => s + (week.calls[m]?.closedWon || 0), 0))}</td>
             <td colSpan={3}></td>
           </tr></tfoot>
         </table>
@@ -866,15 +911,17 @@ function Headlines({ week, meta, updateWeek }) {
 }
 
 /* ============================== TIPS ============================== */
-function Tips({ week, updateWeek }) {
+function Tips({ week, meta, updateWeek }) {
   const [paste, setPaste] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
   const toggle = (id) => updateWeek((w) => { w.tips = w.tips.map((t) => t.id === id ? { ...t, included: !t.included } : t); return w; });
   const del = (id) => updateWeek((w) => { w.tips = w.tips.filter((t) => t.id !== id); return w; });
-  const addManual = () => updateWeek((w) => { w.tips.push({ id: uid(), source: "Other", text: "", included: false }); return w; });
+  const addManual = () => updateWeek((w) => { w.tips.push({ id: uid(), source: "Other", text: "", owner: "", status: "not_tried", included: false }); return w; });
   const editText = (id, v) => updateWeek((w) => { w.tips = w.tips.map((t) => t.id === id ? { ...t, text: v } : t); return w; });
+  const setField = (id, f, v) => updateWeek((w) => { w.tips = w.tips.map((t) => t.id === id ? { ...t, [f]: v } : t); return w; });
+  const ownerOpts = (o) => ["", ...((meta.managers.includes(o) || !o) ? meta.managers : [o, ...meta.managers])];
 
   async function suggest() {
     if (!paste.trim()) { setErr("Paste some Slack wins or Gong notes first."); return; }
@@ -894,7 +941,7 @@ function Tips({ week, updateWeek }) {
       const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
       const clean = txt.replace(/```json|```/g, "").trim();
       const arr = JSON.parse(clean);
-      updateWeek((w) => { arr.slice(0, 3).forEach((t) => w.tips.push({ id: uid(), source: t.source || "Other", text: t.text, included: false })); return w; });
+      updateWeek((w) => { arr.slice(0, 3).forEach((t) => w.tips.push({ id: uid(), source: t.source || "Other", text: t.text, owner: "", status: "not_tried", included: false })); return w; });
       setPaste("");
     } catch (e) { setErr("Couldn't generate suggestions. In Claude this works out of the box; running standalone, set AI_ENDPOINT to your API proxy (see README). Manual add still works."); }
     setBusy(false);
@@ -925,17 +972,83 @@ function Tips({ week, updateWeek }) {
 
       {week.tips.length === 0 ? <div className="empty"><b>No tips yet</b>Draft some from your wins above, or add one manually.</div> :
         <div className="grid" style={{ gap: 9 }}>
-          {week.tips.map((t) => (
+          {week.tips.map((t) => {
+            const stColor = { not_tried: T.muted, in_progress: T.warn, successful: T.up }[t.status || "not_tried"];
+            return (
             <div className={"tip" + (t.included ? " inc" : "")} key={t.id}>
               <button className={"chk" + (t.included ? " on" : "")} onClick={() => toggle(t.id)}>{t.included && <Check size={14} />}</button>
               <div style={{ flex: 1 }}>
                 <textarea style={{ width: "100%", minHeight: 38, resize: "vertical", border: "none", padding: 0, background: "transparent" }}
                   value={t.text} onChange={(e) => editText(t.id, e.target.value)} />
+                <div className="row" style={{ gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                  <select value={t.owner || ""} style={{ fontSize: 12 }} onChange={(e) => setField(t.id, "owner", e.target.value)}>
+                    {ownerOpts(t.owner).map((m) => <option key={m || "none"} value={m}>{m || "Unassigned"}</option>)}
+                  </select>
+                  <select value={t.status || "not_tried"} style={{ fontSize: 12, color: stColor, fontWeight: 600 }} onChange={(e) => setField(t.id, "status", e.target.value)}>
+                    {TIP_STATUS.map(([v, label]) => <option key={v} value={v} style={{ color: T.text }}>{label}</option>)}
+                  </select>
+                  <span className="src">{t.source}</span>
+                </div>
               </div>
-              <span className="src">{t.source}</span>
               <button className="ico" onClick={() => del(t.id)}><X size={15} /></button>
-            </div>))}
+            </div>);
+          })}
         </div>}
+    </>
+  );
+}
+
+/* ============================== GRR ============================== */
+function GRR({ week, meta, updateWeek }) {
+  const rows = week.grr?.rows || [];
+  const ensure = (w) => { if (!w.grr) w.grr = { rows: [] }; return w; };
+  const add = () => updateWeek((w) => { ensure(w).grr.rows.push({ id: uid(), manager: meta.managers[0] || "", segment: "Enterprise", goal: null, closedWon: null, grrCall: null, notes: "" }); return w; });
+  const upd = (id, f, v) => updateWeek((w) => { ensure(w).grr.rows = w.grr.rows.map((r) => r.id === id ? { ...r, [f]: (f === "goal" || f === "closedWon" || f === "grrCall") ? num(v) : v } : r); return w; });
+  const del = (id) => updateWeek((w) => { ensure(w).grr.rows = w.grr.rows.filter((r) => r.id !== id); return w; });
+
+  const sum = (k) => rows.reduce((s, r) => s + (r[k] || 0), 0);
+  const tGoal = sum("goal"), tWon = sum("closedWon"), tCall = sum("grrCall");
+  const ownerOpts = (o) => (meta.managers.includes(o) || !o ? meta.managers : [o, ...meta.managers]);
+  const card = { padding: "12px 16px" };
+  const lbl = { fontSize: 11, color: T.muted, textTransform: "uppercase", letterSpacing: ".5px" };
+
+  return (
+    <>
+      <h2>Gross revenue retention</h2>
+      <p className="sub">Per-manager GRR goal, closed-won so far, and the call on where it lands. Attainment is closed-won vs. goal.</p>
+
+      <div className="grid" style={{ gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 14 }}>
+        <div className="card" style={card}><div style={lbl}>GRR goal</div><div className="mono" style={{ fontSize: 20, fontWeight: 600, marginTop: 4 }}>{money(tGoal)}</div></div>
+        <div className="card" style={card}><div style={lbl}>Closed-won</div><div className="mono" style={{ fontSize: 20, fontWeight: 600, marginTop: 4, color: T.up }}>{money(tWon)}</div></div>
+        <div className="card" style={card}><div style={lbl}>Attainment</div><div className="mono" style={{ fontSize: 20, fontWeight: 600, marginTop: 4, color: tGoal && tWon / tGoal >= 1 ? T.up : T.warn }}>{tGoal ? pct(tWon / tGoal * 100) : "—"}</div></div>
+      </div>
+
+      <div className="card" style={{ padding: 0 }}>
+        {rows.length === 0 ? <div style={{ padding: 18 }}><div className="empty"><b>No GRR rows yet</b>Add a manager row to start tracking retention.</div></div> :
+        <table>
+          <thead><tr><th>Manager</th><th>Segment</th><th style={{ textAlign: "right" }}>Goal</th><th style={{ textAlign: "right" }}>Closed-won</th><th style={{ textAlign: "right" }}>GRR call</th><th style={{ textAlign: "right" }}>Attain</th><th>Notes</th><th></th></tr></thead>
+          <tbody>{rows.map((r) => {
+            const at = r.goal ? (r.closedWon ?? 0) / r.goal * 100 : null;
+            return (
+              <tr key={r.id}>
+                <td><select value={r.manager} onChange={(e) => upd(r.id, "manager", e.target.value)}>{ownerOpts(r.manager).map((m) => <option key={m}>{m}</option>)}</select></td>
+                <td><input value={r.segment || ""} placeholder="segment" onChange={(e) => upd(r.id, "segment", e.target.value)} /></td>
+                <td className="cellnum"><input type="number" value={r.goal ?? ""} placeholder="—" onChange={(e) => upd(r.id, "goal", e.target.value)} /></td>
+                <td className="cellnum"><input type="number" value={r.closedWon ?? ""} placeholder="—" onChange={(e) => upd(r.id, "closedWon", e.target.value)} /></td>
+                <td className="cellnum"><input type="number" value={r.grrCall ?? ""} placeholder="—" onChange={(e) => upd(r.id, "grrCall", e.target.value)} /></td>
+                <td className="mono" style={{ textAlign: "right", color: at == null ? T.muted : at >= 100 ? T.up : at >= 90 ? T.warn : T.down }}>{at == null ? "—" : pct(at)}</td>
+                <td><input value={r.notes || ""} placeholder="notes…" onChange={(e) => upd(r.id, "notes", e.target.value)} /></td>
+                <td><button className="ico" onClick={() => del(r.id)}><Trash2 size={15} /></button></td>
+              </tr>);
+          })}</tbody>
+          <tfoot><tr><td style={{ fontWeight: 600 }}>Total</td><td></td>
+            <td className="mono" style={{ textAlign: "right" }}>{money(tGoal)}</td>
+            <td className="mono" style={{ textAlign: "right", color: T.up }}>{money(tWon)}</td>
+            <td className="mono" style={{ textAlign: "right" }}>{money(tCall)}</td>
+            <td colSpan={3}></td></tr></tfoot>
+        </table>}
+      </div>
+      <button className="btn gho sm" style={{ marginTop: 12 }} onClick={add}><Plus size={14} />Add row</button>
     </>
   );
 }
@@ -944,18 +1057,20 @@ function Tips({ week, updateWeek }) {
 function Trending({ week, meta, updateWeek, flagged }) {
   const t = meta.thresholds;
   const [view, setView] = useState("flagged");
-  const add = () => updateWeek((w) => { w.trending.push({ id: uid(), account: "", owner: meta.managers[0] || "", day180: null, day270: null }); return w; });
+  const add = () => updateWeek((w) => { w.trending.push({ id: uid(), account: "", owner: meta.managers[0] || "", day180: null, day270: null, actionPlan: "" }); return w; });
   const upd = (id, f, v) => updateWeek((w) => { w.trending = w.trending.map((r) => r.id === id ? { ...r, [f]: f === "day180" || f === "day270" ? num(v) : v } : r); return w; });
   const del = (id) => updateWeek((w) => { w.trending = w.trending.filter((r) => r.id !== id); return w; });
 
   const hasD270 = week.trending.some((r) => r.day270 != null);
-  const shown = view === "flagged" ? week.trending.filter((r) => flag(r, t)) : week.trending;
+  const aheadList = week.trending.filter((r) => flagAhead(r, t));
+  const shown = view === "flagged" ? week.trending.filter((r) => flag(r, t))
+    : view === "ahead" ? aheadList : week.trending;
   const ownerOpts = (o) => (meta.managers.includes(o) || !o ? meta.managers : [o, ...meta.managers]);
 
   return (
     <>
-      <h2>Trending behind</h2>
-      <p className="sub">Accounts pacing behind plan. An account is flagged when it's behind <b style={{ color: T.text }}>{t.d180}%</b> at Day 180 {hasD270 ? <><b style={{ color: T.text }}>{t.mode === "and" ? "and" : "or"}</b> behind <b style={{ color: T.text }}>{t.d270}%</b> at Day 270</> : "(no Day 270 data loaded yet — see note below)"}. Values are attainment vs. expected pace, so 42 means at 42% of where the account should be. Accounts not yet at a milestone stay unflagged. Adjust the rule in Settings.</p>
+      <h2>Trending</h2>
+      <p className="sub">Accounts by pace vs. expected. <b style={{ color: T.down }}>Behind</b> = under <b style={{ color: T.text }}>{t.d180}%</b> at Day 180 {hasD270 ? <><b style={{ color: T.text }}>{t.mode === "and" ? "and" : "or"}</b> under <b style={{ color: T.text }}>{t.d270}%</b> at Day 270</> : ""}; <b style={{ color: T.up }}>Ahead</b> = at/over <b style={{ color: T.text }}>{t.aheadD180 ?? 90}%</b> at Day 180. Values are attainment vs. expected pace (42 = at 42% of where it should be). Adjust both rules in Settings.</p>
 
       {!hasD270 && (
         <div className="notice" style={{ marginBottom: 16 }}>
@@ -965,27 +1080,31 @@ function Trending({ week, meta, updateWeek, flagged }) {
       )}
 
       <div className="between" style={{ marginBottom: 10 }}>
-        <b style={{ fontSize: 13, color: T.muted }}>{week.trending.length} tracked · {flagged.length} flagged</b>
+        <b style={{ fontSize: 13, color: T.muted }}>{week.trending.length} tracked · {flagged.length} behind · {aheadList.length} ahead</b>
         <div className="seg">
-          <button className={view === "flagged" ? "on" : ""} onClick={() => setView("flagged")}>Flagged ({flagged.length})</button>
+          <button className={view === "flagged" ? "on" : ""} onClick={() => setView("flagged")}>Behind ({flagged.length})</button>
+          <button className={view === "ahead" ? "on" : ""} onClick={() => setView("ahead")}>Ahead ({aheadList.length})</button>
           <button className={view === "all" ? "on" : ""} onClick={() => setView("all")}>All ({week.trending.length})</button>
         </div>
       </div>
 
       <div className="card" style={{ padding: 0, marginBottom: 14 }}>
-        {shown.length === 0 ? <div style={{ padding: 18 }}><div className="empty"><b>{view === "flagged" ? "Nothing flagged" : "No accounts yet"}</b>{view === "flagged" ? "No accounts breach the rule this week." : "Drop your CSV export below to populate the segment."}</div></div> :
+        {shown.length === 0 ? <div style={{ padding: 18 }}><div className="empty"><b>{view === "flagged" ? "Nothing behind" : view === "ahead" ? "Nothing ahead" : "No accounts yet"}</b>{view === "all" ? "Drop your CSV export below to populate the segment." : "No accounts in this view this week."}</div></div> :
         <table>
-          <thead><tr><th>Account</th><th>Owner</th><th style={{ textAlign: "right" }}>Day 180</th><th style={{ textAlign: "right" }}>Day 270</th><th>Status</th><th></th></tr></thead>
+          <thead><tr><th>Account</th><th>Owner</th><th style={{ textAlign: "right" }}>Day 180</th><th style={{ textAlign: "right" }}>Day 270</th><th>Status</th><th>Action plan</th><th></th></tr></thead>
           <tbody>{shown.map((r) => {
-            const f = flag(r, t);
+            const st = paceState(r, t);
+            const bg = st === "behind" ? "rgba(248,81,73,.06)" : st === "ahead" ? "rgba(63,185,80,.06)" : "transparent";
             return (
-              <tr key={r.id} style={{ background: f ? "rgba(248,81,73,.06)" : "transparent" }}>
+              <tr key={r.id} style={{ background: bg }}>
                 <td><input value={r.account} placeholder="account" onChange={(e) => upd(r.id, "account", e.target.value)} /></td>
                 <td><select value={r.owner} onChange={(e) => upd(r.id, "owner", e.target.value)}>{ownerOpts(r.owner).map((m) => <option key={m}>{m}</option>)}</select></td>
                 <td className="cellnum"><input type="number" value={r.day180 ?? ""} placeholder="—" onChange={(e) => upd(r.id, "day180", e.target.value)} /></td>
                 <td className="cellnum"><input type="number" value={r.day270 ?? ""} placeholder="—" onChange={(e) => upd(r.id, "day270", e.target.value)} /></td>
-                <td>{f ? <span className="tag" style={{ background: "rgba(248,81,73,.15)", color: T.down }}>Behind</span>
+                <td>{st === "behind" ? <span className="tag" style={{ background: "rgba(248,81,73,.15)", color: T.down }}>Behind</span>
+                  : st === "ahead" ? <span className="tag" style={{ background: "rgba(63,185,80,.15)", color: T.up }}>Ahead</span>
                   : <span className="tag" style={{ background: T.panel2, color: T.muted }}>On pace</span>}</td>
+                <td><input value={r.actionPlan || ""} placeholder="plan…" onChange={(e) => upd(r.id, "actionPlan", e.target.value)} /></td>
                 <td><button className="ico" onClick={() => del(r.id)}><Trash2 size={15} /></button></td>
               </tr>);
           })}</tbody>
@@ -1291,7 +1410,7 @@ function SettingsTab({ meta, saveMeta, updateWeek, week, exportData, importData 
   function addMgr() {
     const name = nm.trim(); if (!name || meta.managers.includes(name)) return;
     saveMeta({ ...meta, managers: [...meta.managers, name] });
-    updateWeek((w) => { w.calls[name] = { call: null, commit: null, best: null, note: "", prior: null }; return w; });
+    updateWeek((w) => { w.calls[name] = { call: null, commit: null, best: null, goal: null, closedWon: null, note: "", prior: null }; return w; });
     setNm("");
   }
   function delMgr(m) {
@@ -1331,6 +1450,21 @@ function SettingsTab({ meta, saveMeta, updateWeek, week, exportData, importData 
               <div className="seg">
                 <button className={t.mode === "and" ? "on" : ""} onClick={() => setT({ mode: "and" })}>AND (both)</button>
                 <button className={t.mode === "or" ? "on" : ""} onClick={() => setT({ mode: "or" })}>OR (either)</button>
+              </div></label>
+          </div>
+        </div>
+
+        <div className="card">
+          <b style={{ fontSize: 14 }}>Ahead-of-pace rule</b>
+          <div className="grid" style={{ gap: 12, marginTop: 12 }}>
+            <label className="fld">Ahead threshold at Day 180 (%)
+              <input type="number" value={t.aheadD180 ?? 90} onChange={(e) => setT({ aheadD180: Number(e.target.value) })} /></label>
+            <label className="fld">Ahead threshold at Day 270 (%)
+              <input type="number" value={t.aheadD270 ?? 100} onChange={(e) => setT({ aheadD270: Number(e.target.value) })} /></label>
+            <label className="fld">Combine conditions with
+              <div className="seg">
+                <button className={(t.aheadMode || "and") === "and" ? "on" : ""} onClick={() => setT({ aheadMode: "and" })}>AND (both)</button>
+                <button className={t.aheadMode === "or" ? "on" : ""} onClick={() => setT({ aheadMode: "or" })}>OR (either)</button>
               </div></label>
           </div>
         </div>
